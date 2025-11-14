@@ -14,36 +14,8 @@ const multer = require("multer");
 const rateLimit = require("express-rate-limit");
 const expressAsyncErrors = require("express-async-errors"); // To handle async errors
 
-// Conditionally load Redis dependencies
-let redisClient = null;
-let RedisStore = null;
-let redisStore = null;
-
-try {
-  // Try to connect to Redis if available
-  redisClient = require("./config/redis");
-  RedisStore = require("connect-redis").default;
-  
-  redisClient.on("connect", () => {
-    logger.info("Connected to Redis successfully");
-  });
-
-  redisClient.on("error", (err) => {
-    logger.warn(`Redis connection error: ${err.message}. Continuing without Redis...`);
-    redisClient = null;
-  });
-  
-  if (redisClient) {
-    // Initialize Redis store if Redis is connected
-    redisStore = new RedisStore({
-      client: redisClient,
-      prefix: "session:",
-    });
-    logger.info("Redis store configured successfully");
-  }
-} catch (error) {
-  logger.warn(`Failed to initialize Redis: ${error.message}. Continuing without Redis...`);
-}
+// Load MongoDB session store
+const mongoStore = require("./config/mongoSession");
 
 // Middleware imports
 const errorMiddleware = require("./middleware/errorMiddleware");
@@ -127,11 +99,12 @@ app.use(express.static(path.join(__dirname, "public"), {
   etag: false
 }));
 
-// Session Configuration
+// Session Configuration with MongoDB store
 const sessionConfig = {
   secret: process.env.SESSION_SECRET || process.env.JWT_SECRET,
   resave: false,
   saveUninitialized: false,
+  store: mongoStore,
   cookie: {
     secure: process.env.NODE_ENV === "production", // true in production
     httpOnly: true,
@@ -139,11 +112,6 @@ const sessionConfig = {
     maxAge: 1000 * 60 * 60 * 24, // 1 day
   },
 };
-
-// Add Redis store to session if available
-if (redisStore) {
-  sessionConfig.store = redisStore;
-}
 
 app.use(session(sessionConfig));
 

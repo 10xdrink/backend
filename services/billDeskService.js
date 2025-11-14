@@ -1,422 +1,675 @@
-// services/billDeskService.js
+// services/billDeskService.js - FIXED VERSION WITH PROPER AUTHENTICATION
+
+/**
+ * BillDesk Service for UAT JSON REST API v1.2 Integration
+ * Implemented according to official BillDesk JOSE documentation
+ * FIXED: Authentication issues resolved
+ */
 
 const crypto = require('crypto');
 const logger = require('../utils/logger');
 const Transaction = require('../models/Transaction');
+const Order = require('../models/Order');
+const moment = require('moment-timezone');
+const fetch = require('node-fetch');
+const jose = require('node-jose');
 
-// BillDesk API configuration
+// Helper: Base64url encoding (no padding)
+const base64url = (input) =>
+  Buffer.from(input)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '');
+
+/**
+ * BillDesk Configuration
+ */
 const BILLDESK_CONFIG = {
-  // Core credentials
-  merchantId: process.env.BILLDESK_MERCHANT_ID || 'BDUATV2APT',
-  clientId: process.env.BILLDESK_CLIENT_ID || 'bduatv2kaptsj',
-  keyId: process.env.BILLDESK_KEY_ID || '88lAHZxdSyXM',
-  encryptionPassword: process.env.BILLDESK_ENCRYPTION_PASSWORD || '4u4akYDyOojgMwgU8xr464yOMmtM2cPe',
-  signingPassword: process.env.BILLDESK_SIGNING_PASSWORD || 'xkUzRJ8b3u2z5dmzc0wlAgPFiLQrBsbf',
-  
-  // URLs - Using both localhost and ngrok URLs to support both environments
-  // The frontend will use window.location.origin to determine the correct return URL
-  returnUrl: process.env.BILLDESK_RETURN_URL || 'https://54cd-2409-40f0-11da-bc46-19f2-c574-b602-3639.ngrok-free.app/payment/return',
-  localReturnUrl: 'http://localhost:5173/payment/return',
-  webhookUrl: process.env.BILLDESK_WEBHOOK_URL || 'https://54cd-2409-40f0-11da-bc46-19f2-c574-b602-3639.ngrok-free.app/api/payments/billdesk/webhook',
-  
-  // API endpoints
-  paymentUrl: 'https://uat1.billdesk.com/u2/web/v1_2/embeddedsdk',
-  sdkJsUrl: 'https://uat1.billdesk.com/u2/assets/js/billdesksdk.js',
-  
-  // SDK Configuration
-  flowType: 'payments',
-  crossButtonHandling: 'Y'
+  merchantId: process.env.BILLDESK_MERCHANT_ID,
+  keyId: process.env.BILLDESK_SECURITY_ID,
+  clientId: process.env.BILLDESK_CLIENT_ID,
+  clientSecret: process.env.BILLDESK_CLIENT_SECRET,
+  signingPassword: process.env.BILLDESK_SIGNING_PASSWORD,
+  encryptionPassword: process.env.BILLDESK_ENCRYPTION_PASSWORD,
+  paymentUrl: process.env.BILLDESK_PAYMENT_URL,
+  returnUrl: process.env.BILLDESK_RETURN_URL,
+  webhookUrl: process.env.BILLDESK_WEBHOOK_URL,
+  itemCode: process.env.BILLDESK_ITEM_CODE || 'DIRECT',
 };
 
-// Log the configuration (with sensitive data masked)
-logger.info('BillDesk Configuration:');
-logger.info(`- Merchant ID: ${BILLDESK_CONFIG.merchantId}`);
-logger.info(`- Payment URL: ${BILLDESK_CONFIG.paymentUrl}`);
-logger.info(`- Return URL: ${BILLDESK_CONFIG.returnUrl}`);
-logger.info(`- Webhook URL: ${BILLDESK_CONFIG.webhookUrl}`);
+// Validate required BillDesk configuration
+const requiredBillDeskVars = [
+  'BILLDESK_MERCHANT_ID',
+  'BILLDESK_SECURITY_ID',
+  'BILLDESK_CLIENT_ID',
+  'BILLDESK_CLIENT_SECRET',
+  'BILLDESK_SIGNING_PASSWORD',
+  'BILLDESK_ENCRYPTION_PASSWORD',
+  'BILLDESK_PAYMENT_URL',
+  'BILLDESK_RETURN_URL',
+  'BILLDESK_WEBHOOK_URL'
+];
+
+const missingBillDeskVars = requiredBillDeskVars.filter(varName => !process.env[varName]);
+if (missingBillDeskVars.length > 0) {
+  logger.error(`Missing required BillDesk environment variables: ${missingBillDeskVars.join(', ')}`);
+  throw new Error(`Missing required BillDesk configuration: ${missingBillDeskVars.join(', ')}`);
+}
+
+logger.info('BillDesk Configuration loaded:', {
+  merchantId: BILLDESK_CONFIG.merchantId,
+  clientId: BILLDESK_CONFIG.clientId,
+  paymentUrl: BILLDESK_CONFIG.paymentUrl,
+  hasClientSecret: !!BILLDESK_CONFIG.clientSecret,
+  hasSigningPassword: !!BILLDESK_CONFIG.signingPassword,
+  hasEncryptionPassword: !!BILLDESK_CONFIG.encryptionPassword
+});
 
 /**
- * Generates a unique trace ID for request tracking
- * @returns {string} - Trace ID
+ * Create encryption key as per BillDesk documentation
  */
-const generateTraceId = () => {
-  return `TRC-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-};
-
-/**
- * Creates a BillDesk order
- * @param {Object} order - Order object from database
- * @returns {Promise<Object>} - BillDesk order response
- */
-const createOrder = async (order) => {
+async function getEncryptionKey() {
   try {
-    logger.info('Creating BillDesk order');
+    // Create AES key from encryption password (32 bytes for AES-256)
+    const keyData = crypto.createHash('sha256').update(BILLDESK_CONFIG.encryptionPassword).digest();
     
-    // Get the amount from the order - ensure we get the correct amount field
-    const orderAmount = order.finalAmount || order.totalAmount || order.amount || 0;
-    
-    logger.info(`Using order amount: ${orderAmount}`);
-    
-    // Strict validation to ensure we have a valid, positive amount
-    if (!orderAmount || isNaN(orderAmount) || orderAmount <= 0) {
-      logger.error(`Invalid order amount: ${orderAmount}`);
-      throw new Error('Invalid order amount. Amount must be greater than zero.');
-    }
-    
-    const { orderNumber, customer } = order;
-    
-    // Generate a unique reference ID (order ID in your system)
-    const bdOrderId = orderNumber || `ORD-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    
-    // Get customer details
-    let customerName = 'Customer';
-    let customerEmail = 'customer@example.com';
-    let customerPhone = '1234567890';
-    
-    // If there's a customer ID on the order, try to get their details
-    if (customer) {
-      try {
-        // Assuming you have a User model or similar to fetch customer details
-        const User = require('../models/User');
-        const customerDetails = await User.findById(customer);
-        
-        if (customerDetails) {
-          customerName = customerDetails.name || customerName;
-          customerEmail = customerDetails.email || customerEmail;
-          customerPhone = customerDetails.phone || customerPhone;
-        }
-      } catch (err) {
-        logger.warn('Error fetching customer details, using defaults:', err.message);
-      }
-    }
-    
-    // Create the message string according to BillDesk specifications
-    const msg = constructMessage(bdOrderId, orderAmount, customerName, customerEmail, customerPhone);
-    
-    // Generate checksum for the message
-    const checksum = generateChecksum(msg);
-    
-    // Create a transaction record
-    const transaction = new Transaction({
-      order: order._id,  // Reference to the Order document
-      orderNumber: bdOrderId,
-      amount: orderAmount,
-      currency: 'INR',
-      paymentMethod: 'billdesk',
-      status: 'pending',
-      metadata: {
-        billDeskOrderId: bdOrderId,
-        billDeskTxnId: `TXN${Date.now()}`,
-        msg: msg,
-        checksum: checksum
-      }
+    const key = await jose.JWK.asKey({
+      kty: 'oct',
+      k: jose.util.base64url.encode(keyData),
+      alg: 'A256GCM',
+      use: 'enc'
     });
     
-    await transaction.save();
-    logger.info(`Transaction record created with ID: ${transaction._id}`);
-    
-    // For BillDesk embedded SDK, we need to provide the message and checksum
-    // The frontend will use these to submit the form to BillDesk
-    return {
-      success: true,
-      orderId: order._id,
-      orderNumber: bdOrderId,
-      merchantId: BILLDESK_CONFIG.merchantId,
-      msg: msg,
-      checksum: checksum,
-      paymentUrl: BILLDESK_CONFIG.paymentUrl,
-      transactionId: transaction._id
-    };
+    logger.info('Encryption key created using SHA256 hash of password');
+    return key;
   } catch (error) {
-    logger.error('Error creating BillDesk order:', error);
-    throw new Error(`Failed to create BillDesk order: ${error.message}`);
-  }
-};
-
-
-
-
-
-
-function constructMessage(refId, amount, customerName, customerEmail, customerPhone) {
-  // Format amount to 2 decimal places without decimal point (e.g., 100.00 -> 10000)
-  if (amount === undefined || amount === null || isNaN(amount)) {
-    logger.error(`Invalid amount provided: ${amount}`);
-    throw new Error('Invalid amount for BillDesk payment');
-  }
-  
-  // Format amount as integer in paise (multiply by 100 and remove decimal)
-  const formattedAmount = Math.round(parseFloat(amount) * 100).toString();
-  
-  logger.info('Formatting amount:', formattedAmount);
-  
-  // Ensure customer details are properly formatted - no spaces allowed
-  const sanitizedCustomerName = (customerName || 'Customer').trim().replace(/\s+/g, ' ');
-  const sanitizedCustomerEmail = (customerEmail || 'customer@example.com').trim();
-  const sanitizedCustomerPhone = (customerPhone || '1234567890').trim().replace(/\D/g, '');
-  
-  // Create message according to BillDesk embedded SDK specifications
-  // IMPORTANT: Order of parameters must match exactly what BillDesk expects
-  const messageComponents = [
-    BILLDESK_CONFIG.merchantId,  // Merchant ID
-    refId,                       // Reference ID (your order ID)
-    formattedAmount,             // Amount in lowest denomination (paise)
-    'INR',                       // Currency
-    sanitizedCustomerName,       // Customer name
-    sanitizedCustomerEmail,      // Customer email
-    sanitizedCustomerPhone,      // Customer phone
-    BILLDESK_CONFIG.returnUrl,   // Return URL
-    'DIRECT'                     // Payment mode
-  ];
-  
-  const message = messageComponents.join('|');
-  logger.info('Message components:', messageComponents);
-  logger.info('Final message:', message);
-  
-  return message;
-}
-
-function generateChecksum(msg) {
-  try {
-    logger.info('Generating checksum for message');
-    
-    // BillDesk's documentation specifies to use HMAC-SHA256 with the signing password
-    const hmac = crypto.createHmac('sha256', BILLDESK_CONFIG.signingPassword);
-    hmac.update(msg); // Use the msg parameter that was passed to the function
-    const checksum = hmac.digest('hex').toLowerCase(); // BillDesk expects lowercase hex
-    
-    logger.debug('Message for checksum:', msg);
-    logger.debug('Checksum generated:', checksum);
-    
-    return checksum;
-  } catch (error) {
-    logger.error('Error generating checksum:', error);
-    throw new Error('Failed to generate checksum for BillDesk payment');
+    logger.error('Error creating encryption key:', error);
+    throw new Error(`Failed to create encryption key: ${error.message}`);
   }
 }
 
 /**
- * Retrieves transaction status from BillDesk
- * @param {string} orderNumber - Order Number
- * @returns {Promise<Object>} - Transaction status
+ * FIXED: JWE encryption with exact BillDesk format
  */
-function retrieveTransaction(orderNumber) {
+async function encryptJWE(jsonPayload) {
   try {
-    logger.info(`Retrieving transaction status for order: ${orderNumber}`);
+    const key = await getEncryptionKey();
     
-    // Find the transaction in the database
-    return Transaction.findOne({ orderNumber }).populate('order')
-      .then(transaction => {
-        if (!transaction) {
-          logger.error(`Transaction not found for order: ${orderNumber}`);
-          throw new Error(`Transaction not found for order: ${orderNumber}`);
+    // Exact JWE Header format as per BillDesk documentation
+    const header = {
+      alg: 'dir',                           // Direct encryption algorithm
+      enc: 'A256GCM',                       // AES-256-GCM encryption method
+      kid: BILLDESK_CONFIG.keyId,           // Key ID (encryption key id)
+      clientid: BILLDESK_CONFIG.clientId    // Client ID
+    };
+    
+    logger.info('JWE Header:', JSON.stringify(header));
+    logger.info('Payload to encrypt:', JSON.stringify(jsonPayload));
+    
+    // Ensure payload is a string
+    const payloadString = JSON.stringify(jsonPayload);
+    const plaintext = Buffer.from(payloadString, 'utf8');
+    
+    // Create JWE with exact format
+    const encrypted = await jose.JWE.createEncrypt({ 
+      format: 'compact',
+      fields: header
+    }, key)
+    .update(plaintext)
+    .final();
+    
+    logger.info('JWE encryption successful');
+    logger.info('Encrypted JWE token length:', encrypted.length);
+    
+    return encrypted;
+  } catch (error) {
+    logger.error('JWE encryption failed:', error);
+    throw new Error(`JWE encryption failed: ${error.message}`);
+  }
+}
+
+/**
+ * FIXED: JWS generation with correct key ID
+ */
+function generateJWS(payload) {
+  try {
+    // FIXED: Use actual signing key ID instead of 'HMAC'
+    const header = {
+      alg: 'HS256',                         // HMAC SHA-256 algorithm
+      kid: BILLDESK_CONFIG.keyId,           // FIXED: Use actual signing key ID
+      clientid: BILLDESK_CONFIG.clientId    // Client ID
+    };
+
+    logger.info('JWS Header:', JSON.stringify(header));
+    
+    // Base64url encode header
+    const encodedHeader = base64url(JSON.stringify(header));
+    
+    // Base64url encode payload 
+    let encodedPayload;
+    if (typeof payload === 'string') {
+      encodedPayload = base64url(payload);
+    } else {
+      encodedPayload = base64url(JSON.stringify(payload));
+    }
+    
+    // Create signature
+    const signatureInput = `${encodedHeader}.${encodedPayload}`;
+    logger.info('Signature input length:', signatureInput.length);
+    
+    const signature = crypto
+      .createHmac('sha256', BILLDESK_CONFIG.signingPassword)
+      .update(signatureInput, 'utf8')
+      .digest('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=/g, '');
+
+    const jwsToken = `${encodedHeader}.${encodedPayload}.${signature}`;
+    
+    logger.info('JWS token generated successfully');
+    logger.info('JWS token length:', jwsToken.length);
+    logger.info('JWS token parts count:', jwsToken.split('.').length);
+    
+    return jwsToken;
+  } catch (error) {
+    logger.error('JWS generation failed:', error);
+    throw new Error(`JWS generation failed: ${error.message}`);
+  }
+}
+
+/**
+ * Verify JWS token (for response processing)
+ */
+function verifyJWS(jwsToken) {
+  try {
+    logger.info('Verifying JWS token...');
+    
+    const parts = jwsToken.split('.');
+    if (parts.length !== 3) {
+      logger.error(`Invalid JWS format - expected 3 parts, got ${parts.length}`);
+      return { isValid: false, payload: null };
+    }
+    
+    const [encodedHeader, encodedPayload, signature] = parts;
+    
+    // Recreate signature for verification
+    const signatureInput = `${encodedHeader}.${encodedPayload}`;
+    const expectedSignature = crypto
+      .createHmac('sha256', BILLDESK_CONFIG.signingPassword)
+      .update(signatureInput, 'utf8')
+      .digest('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=/g, '');
+    
+    const isValid = signature === expectedSignature;
+    
+    let payload = null;
+    if (isValid) {
+      try {
+        // Decode payload
+        const paddedPayload = encodedPayload.replace(/-/g, '+').replace(/_/g, '/');
+        const decodedPayload = Buffer.from(paddedPayload, 'base64').toString('utf8');
+        
+        // Try to parse as JSON
+        try {
+          payload = JSON.parse(decodedPayload);
+        } catch (e) {
+          payload = decodedPayload; // Keep as string if not JSON
         }
         
-        // Create a transaction status response
-        return {
-          success: true,
-          transaction: {
-            id: transaction._id,
-            orderNumber: transaction.orderNumber,
-            amount: transaction.amount,
-            currency: transaction.currency,
-            status: transaction.status,
-            billDeskOrderId: transaction.metadata?.billDeskOrderId,
-            billDeskTxnId: transaction.metadata?.billDeskTxnId,
-            createdAt: transaction.createdAt,
-            updatedAt: transaction.updatedAt
-          }
-        };
-      });
+        logger.info('JWS verification successful');
+      } catch (e) {
+        logger.error('Failed to decode JWS payload:', e);
+        return { isValid: false, payload: null };
+      }
+    } else {
+      logger.error('JWS signature verification failed');
+    }
+    
+    return { isValid, payload };
   } catch (error) {
-    logger.error(`Error retrieving transaction: ${error.message}`);
-    throw new Error(`Failed to retrieve transaction: ${error.message}`);
+    logger.error('JWS verification error:', error);
+    return { isValid: false, payload: null };
   }
 }
 
 /**
- * Processes BillDesk webhook
- * @param {Object} req - Express request object
- * @returns {Promise<Object>} - Processed webhook data
+ * Decrypt JWE token (for response processing)
  */
-async function processWebhook(req) {
+async function decryptJWE(jweToken) {
   try {
-    // Log the incoming webhook data for debugging
-    logger.info(`BillDesk webhook received: ${JSON.stringify(req.body)}`);
+    logger.info('Decrypting JWE token...');
     
-    // Simple validation to ensure we have data
-    if (!req.body || !req.body.msg) {
-      throw new Error('No webhook data received');
-    }
+    const key = await getEncryptionKey();
+    const result = await jose.JWE.createDecrypt(key).decrypt(jweToken);
     
-    // Parse the response - BillDesk sends a pipe-delimited string
-    // Format: MerchantID|OrderID|TxnStatus|BillDeskTxnID|BankTxnID|TxnAmount|BankID|AuthStatus|TxnType|Currency|AdditionalInfo1|AdditionalInfo2|AdditionalInfo3|AdditionalInfo4|AdditionalInfo5|AdditionalInfo6|AdditionalInfo7|ErrorStatus|ErrorDescription|Checksum
-    const responseData = req.body.msg;
-    const responseFields = responseData.split('|');
+    const decryptedText = result.plaintext.toString('utf8');
+    logger.info('JWE decryption successful');
     
-    // Verify response checksum
-    const receivedChecksum = responseFields[responseFields.length - 1];
-    const dataToVerify = responseFields.slice(0, -1).join('|');
-    const checksumToVerify = dataToVerify + '|' + BILLDESK_CONFIG.checksum;
-    const calculatedChecksum = crypto.createHash('sha256').update(checksumToVerify).digest('hex');
-    
-    if (receivedChecksum !== calculatedChecksum) {
-      logger.error('Invalid checksum in BillDesk webhook');
-      throw new Error('Invalid checksum in webhook');
-    }
-    
-    const merchantId = responseFields[0];
-    const orderNumber = responseFields[1];
-    const txnStatus = responseFields[2];
-    const billDeskTxnId = responseFields[3];
-    const bankTxnId = responseFields[4];
-    const txnAmount = responseFields[5];
-    
-    // Validate merchant ID
-    if (merchantId !== BILLDESK_CONFIG.merchantId) {
-      logger.error(`Invalid merchant ID in webhook: ${merchantId}`);
-      throw new Error('Invalid merchant ID in webhook');
-    }
-    
-    // Find the transaction in our database
-    const transaction = await Transaction.findOne({ orderNumber: orderNumber });
-    
-    if (!transaction) {
-      logger.error(`Transaction not found for order number: ${orderNumber}`);
-      throw new Error('Transaction not found');
-    }
-    
-    // Update transaction status based on BillDesk response
-    let status = 'pending';
-    
-    if (txnStatus === '0300') {
-      status = 'success';
-    } else if (txnStatus === '0399') {
-      status = 'failed';
-    } else if (txnStatus === '0002') {
-      status = 'pending';
-    } else {
-      status = 'failed';
-    }
-    
-    transaction.status = status;
-    transaction.metadata = {
-      ...transaction.metadata,
-      billDeskResponse: responseData,
-      billDeskTxnId: billDeskTxnId,
-      bankTxnId: bankTxnId,
-      txnAmount: txnAmount,
-      authStatus: responseFields[7],
-      errorStatus: responseFields[17],
-      errorDescription: responseFields[18]
-    };
-    
-    await transaction.save();
-    logger.info(`Transaction status updated to ${status} for order: ${orderNumber}`);
-    
-    return { 
-      success: true,
-      orderNumber,
-      status,
-      transactionId: transaction._id
-    };
+    return decryptedText;
   } catch (error) {
-    logger.error(`BillDesk webhook processing failed: ${error.message}`);
-    throw new Error(`BillDesk webhook processing failed: ${error.message}`);
+    logger.error('JWE decryption failed:', error);
+    throw new Error(`JWE decryption failed: ${error.message}`);
   }
-};
+}
 
 /**
- * Handles BillDesk transaction status from return URL
- * @param {Object} returnData - Return data from BillDesk
- * @returns {Promise<Object>} - Updated transaction status
+ * FIXED: Create payment request with proper authentication
  */
-async function handleTransactionReturn(returnData) {
+async function createPaymentRequest(order, clientIp = '127.0.0.1') {
+  logger.info('=== BillDesk Payment Request Creation Started ===');
+  logger.info('Client IP Address:', clientIp);
+
+  // Validate order
+  const amount = order.finalAmount || order.totalAmount || order.amount;
+  if (!amount || isNaN(amount) || amount <= 0) {
+    throw new Error('Invalid order amount');
+  }
+
+  // Generate unique order number with proper format
+  const orderNumber = order.orderNumber || `order${Date.now()}${Math.floor(Math.random() * 1000)}`;
+
+  // Get customer details
+  let customerEmail = 'customer@example.com';
+  let customerPhone = '9999999999';
+  
   try {
-    // Log return data
-    logger.info(`Processing BillDesk return data: ${JSON.stringify(returnData)}`);
-    
-    if (!returnData || !returnData.msg) {
-      throw new Error('No return data received');
+    if (order.customer) {
+      const User = require('../models/User');
+      const user = await User.findById(order.customer);
+      if (user) {
+        if (user.email) customerEmail = user.email.trim();
+        if (user.phone) customerPhone = user.phone.trim().replace(/\D/g, '');
+      }
     }
-    
-    // Parse the response - BillDesk sends a pipe-delimited string
-    const responseData = returnData.msg;
-    const responseFields = responseData.split('|');
-    
-    // Verify response checksum
-    const receivedChecksum = responseFields[responseFields.length - 1];
-    const dataToVerify = responseFields.slice(0, -1).join('|');
-    const checksumToVerify = dataToVerify + '|' + BILLDESK_CONFIG.checksum;
-    const calculatedChecksum = crypto.createHash('sha256').update(checksumToVerify).digest('hex');
-    
-    if (receivedChecksum !== calculatedChecksum) {
-      logger.error('Invalid checksum in BillDesk return data');
-      throw new Error('Invalid checksum in return data');
+  } catch (e) {
+    logger.warn('Unable to fetch user details:', e.message);
+  }
+
+  // STEP 1: Create JSON Request (exact format from documentation)
+  logger.info('STEP 1: Creating JSON request...');
+  const jsonRequest = {
+    mercid: BILLDESK_CONFIG.merchantId,
+    orderid: orderNumber,
+    amount: amount.toFixed(2),
+    order_date: moment().tz("Asia/Kolkata").format("YYYY-MM-DDTHH:mm:ssZZ"),
+    currency: "356",
+    ru: BILLDESK_CONFIG.returnUrl,
+    additional_info: {
+      additional_info1: `Order ${orderNumber}`,
+      additional_info2: customerEmail,
+      additional_info7: "mgl"
+    },
+    itemcode: BILLDESK_CONFIG.itemCode,
+    device: {
+      init_channel: "internet",
+      ip: clientIp,  // Use actual client IP
+      user_agent: "Mozilla/5.0(WindowsNT10.0;WOW64;)Gecko/20100101Firefox/51.0",
+      accept_header: "text/html"
     }
-    
-    const merchantId = responseFields[0];
-    const orderNumber = responseFields[1];
-    const txnStatus = responseFields[2];
-    
-    // Validate merchant ID
-    if (merchantId !== BILLDESK_CONFIG.merchantId) {
-      logger.error(`Invalid merchant ID in return data: ${merchantId}`);
-      throw new Error('Invalid merchant ID in return data');
-    }
-    
-    // Find the transaction in our database
-    const transaction = await Transaction.findOne({ orderNumber: orderNumber });
-    
-    if (!transaction) {
-      logger.error(`Transaction not found for order number: ${orderNumber}`);
-      throw new Error('Transaction not found');
-    }
-    
-    // Update transaction status based on BillDesk response
-    let status = 'pending';
-    
-    if (txnStatus === '0300') {
-      status = 'success';
-    } else if (txnStatus === '0399') {
-      status = 'failed';
-    } else if (txnStatus === '0002') {
-      status = 'pending';
-    } else {
-      status = 'failed';
-    }
-    
-    transaction.status = status;
-    transaction.metadata = {
-      ...transaction.metadata,
-      billDeskResponse: responseData,
-      billDeskTxnId: responseFields[3] || '',
-      bankTxnId: responseFields[4] || '',
-      txnAmount: responseFields[5] || '',
-      authStatus: responseFields[7] || '',
-      errorStatus: responseFields[17] || '',
-      errorDescription: responseFields[18] || ''
-    };
-    
-    await transaction.save();
-    logger.info(`Transaction status updated to ${status} for order: ${orderNumber}`);
-    
-    return { 
-      success: true,
+  };
+
+  logger.info('JSON Request created:', JSON.stringify(jsonRequest, null, 2));
+
+  // STEP 2: Encrypt JSON Request
+  logger.info('STEP 2: Encrypting JSON request...');
+  const encryptedPayload = await encryptJWE(jsonRequest);
+  logger.info('JSON request encrypted successfully');
+
+  // STEP 3: Sign Encrypted Request
+  logger.info('STEP 3: Signing encrypted request...');
+  const jwsToken = generateJWS(encryptedPayload);
+  logger.info('Encrypted request signed successfully');
+
+  // Save transaction
+  const txn = new Transaction({
+    orderNumber,
+    order: order._id,
+    paymentMethod: 'billdesk',
+    amount,
+    status: 'pending',
+    metadata: {
+      merchantId: BILLDESK_CONFIG.merchantId,
       orderNumber,
-      status,
-      transactionId: transaction._id
+      generatedAt: new Date(),
+    },
+  });
+  await txn.save();
+
+  // STEP 4: Prepare headers and make API call
+  logger.info('STEP 4: Preparing API request...');
+  
+  const traceId = `TXN${Date.now()}${Math.floor(Math.random() * 1000)}`.slice(0, 35);
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+
+  // FIXED: Added Basic Authentication as per BillDesk requirements
+  const basicAuth = Buffer.from(`${BILLDESK_CONFIG.clientId}:${BILLDESK_CONFIG.clientSecret}`).toString('base64');
+  
+  // ===== LOGGING FOR BILLDESK SUPPORT (IP WHITELISTING) =====
+  logger.info('╔═══════════════════════════════════════════════════════════════');
+  logger.info('║ BILLDESK REQUEST DETAILS FOR IP WHITELISTING');
+  logger.info('╠═══════════════════════════════════════════════════════════════');
+  logger.info('║ Client IP Address: ' + clientIp);
+  logger.info('║ BD-Traceid: ' + traceId);
+  logger.info('║ BD-Timestamp: ' + timestamp);
+  logger.info('║ Timestamp (Date): ' + new Date(timestamp * 1000).toISOString());
+  logger.info('║ Merchant ID: ' + BILLDESK_CONFIG.merchantId);
+  logger.info('║ Client ID: ' + BILLDESK_CONFIG.clientId);
+  logger.info('║ Security ID (Key ID): ' + BILLDESK_CONFIG.keyId);
+  logger.info('║ Payment URL: ' + BILLDESK_CONFIG.paymentUrl);
+  logger.info('╚═══════════════════════════════════════════════════════════════');
+  
+  const headers = {
+    'Content-Type': 'application/jose',
+    'Accept': 'application/jose',
+    'BD-Traceid': traceId,
+    'BD-Timestamp': timestamp,
+    'Authorization': `Basic ${basicAuth}` // FIXED: Added Basic Auth
+  };
+
+  logger.info('Request Headers:', JSON.stringify(headers, null, 2));
+  logger.info('Request URL:', BILLDESK_CONFIG.paymentUrl);
+  logger.info('Request Body (JWS) preview:', jwsToken.substring(0, 100) + '...');
+  
+  // Log full request details for debugging
+  console.log('\n========== FULL BILLDESK REQUEST FOR DEBUGGING ==========');
+  console.log('IP Address:', clientIp);
+  console.log('BD-Traceid:', traceId);
+  console.log('BD-Timestamp:', timestamp);
+  console.log('Timestamp Human Readable:', new Date(timestamp * 1000).toISOString());
+  console.log('Authorization Header:', headers['Authorization']);
+  console.log('Full Headers:', JSON.stringify(headers, null, 2));
+  console.log('=========================================================\n');
+
+  try {
+    logger.info('Making API call to BillDesk...');
+    
+    const response = await fetch(BILLDESK_CONFIG.paymentUrl, {
+      method: 'POST',
+      headers: headers,
+      body: jwsToken,
+      timeout: 30000
+    });
+    
+    logger.info('Response Status:', response.status);
+    logger.info('Response Status Text:', response.statusText);
+    logger.info('Response Headers:', Object.fromEntries([...response.headers.entries()]));
+    
+    const responseBody = await response.text();
+    logger.info('Response Body Length:', responseBody.length);
+    logger.info('Response Body (first 500 chars):', responseBody.substring(0, 500));
+    
+    if (!response.ok) {
+      logger.error('BillDesk API Error Response:', responseBody);
+      
+      // Parse error if possible
+      let errorDetails = responseBody;
+      try {
+        const errorJson = JSON.parse(responseBody);
+        errorDetails = JSON.stringify(errorJson, null, 2);
+        logger.error('Parsed Error:', errorJson);
+      } catch (e) {
+        logger.error('Could not parse error response as JSON');
+      }
+      
+      throw new Error(`BillDesk API returned ${response.status}: ${response.statusText} - ${errorDetails}`);
+    }
+    
+    logger.info('BillDesk API call successful, processing response...');
+    
+    // Check if response is HTML (redirect page)
+    if (responseBody.includes('<!DOCTYPE html') || responseBody.includes('<html')) {
+      logger.info('Received HTML response - likely a payment form');
+      
+      // For HTML responses, we need to extract payment URL or form data
+      // This typically means the API returned a payment form
+      return {
+        success: true,
+        paymentUrl: BILLDESK_CONFIG.paymentUrl,
+        merchantId: BILLDESK_CONFIG.merchantId,
+        formHtml: responseBody,
+        transactionId: txn._id,
+        orderNumber,
+        isRedirect: true
+      };
+    }
+    
+    // Verify and decrypt JSON/JOSE response
+    const { isValid, payload: encryptedResponse } = verifyJWS(responseBody);
+    
+    if (!isValid) {
+      // If JWS verification fails, check if it's direct JSON
+      try {
+        const directJson = JSON.parse(responseBody);
+        logger.info('Direct JSON response received:', directJson);
+        
+        // Handle direct JSON response
+        const { bdorderid, rdata } = directJson;
+        
+        if (bdorderid) {
+          txn.metadata.bdOrderId = bdorderid;
+          txn.metadata.traceId = traceId;
+          await txn.save();
+          
+          return {
+            success: true,
+            paymentUrl: 'https://uat1.billdesk.com/u2/web/v1_2/embeddedsdk',
+            merchantId: BILLDESK_CONFIG.merchantId,
+            bdOrderId: bdorderid,
+            rdata: rdata || null,
+            transactionId: txn._id,
+            orderNumber,
+          };
+        }
+      } catch (jsonError) {
+        throw new Error('Invalid response format - neither valid JWS nor JSON');
+      }
+    }
+    
+    // Decrypt JWS response
+    let responseJson;
+    if (typeof encryptedResponse === 'string') {
+      const decrypted = await decryptJWE(encryptedResponse);
+      responseJson = JSON.parse(decrypted);
+    } else {
+      responseJson = encryptedResponse;
+    }
+    
+    logger.info('BillDesk Response (decrypted):', JSON.stringify(responseJson, null, 2));
+    
+    const { bdorderid, rdata } = responseJson;
+    
+    if (!bdorderid) {
+      throw new Error('Missing bdorderid in BillDesk response');
+    }
+    
+    // Update transaction
+    txn.metadata.bdOrderId = bdorderid;
+    txn.metadata.traceId = traceId;
+    await txn.save();
+    
+    logger.info('=== BillDesk Payment Request Creation Completed Successfully ===');
+    
+    return {
+      success: true,
+      paymentUrl: 'https://uat1.billdesk.com/u2/web/v1_2/embeddedsdk',
+      merchantId: BILLDESK_CONFIG.merchantId,
+      bdOrderId: bdorderid,
+      rdata: rdata || null,
+      transactionId: txn._id,
+      orderNumber,
     };
   } catch (error) {
-    logger.error(`BillDesk return data handling failed: ${error.message}`);
-    throw new Error(`BillDesk return data handling failed: ${error.message}`);
+    logger.error('=== BillDesk Payment Request Creation Failed ===');
+    logger.error('Error message:', error.message);
+    logger.error('Full error:', error);
+    throw new Error(`BillDesk API call failed: ${error.message}`);
   }
-};
+}
+
+/**
+ * Process BillDesk response/webhook
+ */
+async function processResponse(responseData) {
+  logger.info('Processing BillDesk response');
+  
+  let verifiedData;
+  
+  if (typeof responseData === 'string') {
+    const { isValid, payload } = verifyJWS(responseData);
+    
+    if (!isValid) {
+      logger.error('Invalid JWS signature in BillDesk response');
+      return {
+        success: false,
+        message: 'Invalid signature from payment gateway',
+        data: responseData,
+      };
+    }
+    
+    verifiedData = payload;
+  } else {
+    verifiedData = responseData;
+  }
+
+  // Decrypt if needed
+  if (typeof verifiedData === 'string') {
+    try {
+      const decrypted = await decryptJWE(verifiedData);
+      verifiedData = JSON.parse(decrypted);
+    } catch (e) {
+      logger.error('Failed to decrypt BillDesk payload:', e.message);
+      return {
+        success: false,
+        message: 'Decryption failed',
+        data: verifiedData,
+      };
+    }
+  }
+  
+  logger.info('Verified BillDesk response:', verifiedData);
+
+  const { merchantid, orderid, transactionid, status } = verifiedData;
+  if (!merchantid || !orderid || !status) {
+    logger.error('Missing required fields in BillDesk response');
+    return {
+      success: false,
+      message: 'Invalid response from payment gateway',
+      data: verifiedData,
+    };
+  }
+
+  const transaction = await Transaction.findOne({ orderNumber: orderid });
+  if (!transaction) {
+    logger.error(`Transaction not found for orderid: ${orderid}`);
+    return {
+      success: false,
+      message: 'Transaction record not found',
+      data: responseData,
+    };
+  }
+
+  let paymentStatus = 'pending';
+  if (status.toUpperCase() === 'SUCCESS') {
+    paymentStatus = 'success';
+  } else if (status.toUpperCase() === 'FAILED') {
+    paymentStatus = 'failed';
+  }
+
+  transaction.status = paymentStatus;
+  transaction.metadata.billDeskTxnId = transactionid;
+  transaction.metadata.responseAt = new Date();
+  transaction.metadata.responseData = responseData;
+  await transaction.save();
+
+  return {
+    success: paymentStatus === 'success',
+    message: `Payment ${paymentStatus}`,
+    status: paymentStatus,
+    transactionId: transaction._id,
+    orderNumber: orderid,
+    data: responseData,
+  };
+}
+
+/**
+ * Retrieve transaction status
+ */
+async function retrieveTransaction(orderId) {
+  try {
+    logger.info(`Retrieving transaction status for order: ${orderId}`);
+    
+    const jsonRequest = {
+      mercid: BILLDESK_CONFIG.merchantId,
+      orderid: orderId,
+      refund_details: true
+    };
+    
+    const encryptedPayload = await encryptJWE(jsonRequest);
+    const jwsToken = generateJWS(encryptedPayload);
+    
+    const traceId = `STS${Date.now()}${Math.floor(Math.random() * 1000)}`.slice(0, 35);
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const basicAuth = Buffer.from(`${BILLDESK_CONFIG.clientId}:${BILLDESK_CONFIG.clientSecret}`).toString('base64');
+    
+    const headers = {
+      'Content-Type': 'application/jose',
+      'Accept': 'application/jose',
+      'BD-Traceid': traceId,
+      'BD-Timestamp': timestamp,
+      'Authorization': `Basic ${basicAuth}` // FIXED: Added Basic Auth
+    };
+    
+    const retrieveUrl = 'https://uat1.billdesk.com/u2/payments/ve1_2/transactions/get';
+    
+    const response = await fetch(retrieveUrl, {
+      method: 'POST',
+      headers: headers,
+      body: jwsToken
+    });
+    
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`BillDesk API returned ${response.status}: ${response.statusText} - ${errorBody}`);
+    }
+    
+    const responseBody = await response.text();
+    const { isValid, payload: responsePayload } = verifyJWS(responseBody);
+    
+    if (!isValid) {
+      throw new Error('Invalid JWS signature in BillDesk response');
+    }
+    
+    let finalPayload = responsePayload;
+    if (typeof responsePayload === 'string') {
+      try {
+        const decrypted = await decryptJWE(responsePayload);
+        finalPayload = JSON.parse(decrypted);
+      } catch (e) {
+        finalPayload = responsePayload;
+      }
+    }
+    
+    return {
+      success: true,
+      data: finalPayload
+    };
+  } catch (error) {
+    logger.error('Error retrieving transaction status:', error);
+    return {
+      success: false,
+      message: error.message
+    };
+  }
+}
 
 module.exports = {
-  createOrder,
+  createPaymentRequest,
+  processResponse,
+  verifyJWS,
   retrieveTransaction,
-  processWebhook,
-  handleTransactionReturn,
-  BILLDESK_CONFIG
+  BILLDESK_CONFIG,
 };

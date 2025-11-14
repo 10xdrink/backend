@@ -154,6 +154,16 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
     couponCode: couponCode || null,
   });
   
+  // Populate product details for the email
+  const populatedItems = [];
+  for (const item of order.items) {
+    const product = await Product.findById(item.product);
+    populatedItems.push({
+      ...item.toObject(),
+      product: product
+    });
+  }
+  
   // Reduce stock for each product variant
   try {
     for (const item of items) {
@@ -299,13 +309,13 @@ exports.createOrder = asyncHandler(async (req, res, next) => {
               </tr>
             </thead>
             <tbody>
-              ${order.items.map(item => {
+              ${populatedItems.map(item => {
                 const priceINR = item.price * USD_TO_INR_RATE;
                 const subtotalINR = priceINR * item.quantity;
                 return `
                   <tr>
-                    <td><img src="${item.product.thumbnail || 'https://via.placeholder.com/50'}" alt="${item.product.title}" width="50" height="50"></td>
-                    <td>${item.product.title}</td>
+                    <td><img src="${item.product.thumbnail || 'https://via.placeholder.com/50'}" alt="${item.product.title || 'Product'}" width="50" height="50"></td>
+                    <td>${item.product.title || 'Product'}</td>
                     <td>${item.quantity}</td>
                     <td>$${item.price.toFixed(2)}</td>
                     <td>₹${priceINR.toFixed(2)}</td>

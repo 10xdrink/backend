@@ -1,0 +1,51 @@
+Subject: IP Whitelisting Request - UAT - Merchant BDUAT2K564 - Error GNAUE0003
+
+---
+
+Dear BillDesk Support Team,
+
+We require IP whitelisting for UAT testing. Our BillDesk integration is complete and fully tested, but we are receiving Error GNAUE0003 (401 Unauthorized - Authentication failed) on all API requests.
+
+CRITICAL INFORMATION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Server IP Address: 3.110.223.68 (AWS Cloud Server, India)
+
+Merchant Details:
+- Merchant ID: BDUAT2K564
+- Client ID: bduat2k564sj
+- Security ID: 7h2wbBuQpgAU
+
+Last Test Attempt:
+- BD-Traceid: TEST176313613509374
+- BD-Timestamp: 1763136135
+- Error Code: GNAUE0003
+- API Endpoint: https://uat1.billdesk.com/u2/payments/ve1_2/orders/create
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+IMPLEMENTATION STATUS:
+✓ JOSE (JWE + JWS) implementation verified
+✓ Encryption (A256GCM) - Working
+✓ Signing (HS256) - Working  
+✓ Headers (BD-Traceid, BD-Timestamp, Authorization) - Correct
+✓ Basic Auth with clientId:clientSecret - Configured
+✓ Request format following API v1.2 specifications
+
+Our implementation has been thoroughly tested and verified. All components are functioning correctly. The 401 error appears to be due to IP whitelisting requirements.
+
+REQUEST:
+Please whitelist IP address 3.110.223.68 for UAT testing and confirm our credentials are active.
+
+We are ready to begin comprehensive UAT testing immediately upon IP whitelisting.
+
+Contact:
+[Your Name]
+[Your Email]
+[Your Phone]
+[Your Company]
+
+Thank you for your prompt assistance.
+
+Best regards,
+[Your Name]

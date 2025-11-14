@@ -1,61 +1,71 @@
 // config/redis.js
-const redis = require('redis');
+// NOTE: Redis is NO LONGER used for session management (now using MongoDB).
+// However, Redis is still required for BullMQ job queues (emailJob, paymentJob, reportJob).
+// If you want to completely remove Redis, you'll need to replace BullMQ with an alternative.
+
+const { createClient } = require('redis');
 const logger = require('../utils/logger');
 require('dotenv').config();
 
-const {
-  REDIS_HOST,
-  REDIS_PORT,
-  REDIS_PASSWORD
-  
-} = process.env;
+let redisClient = null;
 
-const redisClient = redis.createClient({
-  socket: {
-    host: REDIS_HOST,
-    port: REDIS_PORT,
-    tls: {}, // Add this line to enable TLS if required
-  },
-  password: REDIS_PASSWORD,
-});
-
-// Handle Redis client errors
-redisClient.on('error', (err) => {
-  logger.error('Redis Client Error:', err);
-});
-
-// Log Redis connection attempt
-redisClient.on('connect', () => {
-  logger.info('Connecting to Redis...');
-});
-
-// Log successful Redis connection
-redisClient.on('ready', () => {
-  logger.info('Connected to Redis successfully!');
-});
-
-// Connect to Redis server asynchronously
-(async () => {
+// Only attempt to connect if REDIS_URL is defined
+if (process.env.REDIS_URL) {
   try {
-    await redisClient.connect();
-  } catch (error) {
-    logger.error('Could not establish a connection with Redis. ' + error);
-  }
-})();
+    // Create Redis client with better error handling
+    redisClient = createClient({
+      url: process.env.REDIS_URL,
+      socket: {
+        connectTimeout: 5000, // 5 seconds timeout
+        reconnectStrategy: (retries) => {
+          // Return false to stop retrying after 3 attempts
+          if (retries > 3) {
+            logger.warn(`Redis connection failed after ${retries} retries, stopping attempts`);
+            return false;
+          }
+          // Exponential backoff with max delay of 3 seconds
+          const delay = Math.min(Math.pow(2, retries) * 100, 3000);
+          return delay;
+        },
+      },
+    });
 
-// Graceful shutdown handling
-const gracefulShutdown = async () => {
-  try {
-    await redisClient.quit();
-    logger.info('Redis client disconnected successfully.');
-    process.exit(0);
-  } catch (error) {
-    logger.error('Error during Redis client disconnection:', error);
-    process.exit(1);
-  }
-};
+    // Log Redis errors but don't crash the app
+    redisClient.on('error', (err) => {
+      logger.warn(`Redis Client Error: ${err}. Continuing without Redis...`);
+    });
 
-process.on('SIGINT', gracefulShutdown);
-process.on('SIGTERM', gracefulShutdown);
+    // Connect to Redis (only once)
+    (async () => {
+      try {
+        await redisClient.connect();
+        logger.info('Connected to Redis successfully!');
+      } catch (err) {
+        logger.warn(`Redis connection failed: ${err.message}. Continuing without Redis...`);
+        redisClient = null;
+      }
+    })();
+
+    // Graceful shutdown handling
+    const gracefulShutdown = async () => {
+      if (redisClient && redisClient.isOpen) {
+        try {
+          await redisClient.quit();
+          logger.info('Redis client disconnected successfully.');
+        } catch (error) {
+          logger.warn(`Error during Redis client disconnection: ${error.message}`);
+        }
+      }
+    };
+
+    process.on('SIGINT', gracefulShutdown);
+    process.on('SIGTERM', gracefulShutdown);
+  } catch (error) {
+    logger.warn(`Redis initialization error: ${error.message}. Continuing without Redis...`);
+    redisClient = null;
+  }
+} else {
+  logger.warn('REDIS_URL not defined. Continuing without Redis...');
+}
 
 module.exports = redisClient;

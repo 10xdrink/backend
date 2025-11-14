@@ -11,7 +11,8 @@ const {
   initializePayment,
   checkPaymentStatus,
   handlePaymentReturn,
-  handleWebhook
+  handleWebhook,
+  proxyPaymentRequest
 } = require('../controllers/billDeskController');
 
 // Protected endpoints
@@ -21,5 +22,8 @@ router.get('/status/:orderId', protect, checkPaymentStatus);
 // Public callbacks from BillDesk
 router.post('/return', handlePaymentReturn);
 router.post('/webhook', handleWebhook);
+
+// Proxy endpoint for frontend to make BillDesk API calls
+router.post('/proxy', proxyPaymentRequest);
 
 module.exports = router;

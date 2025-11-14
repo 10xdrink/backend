@@ -1,45 +1,44 @@
-const redisClient = require('../config/redis');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const mongoStore = require('../config/mongoSession');
 
 // Define session expiration time in milliseconds
 const SESSION_EXPIRATION_TIME = 30 * 60 * 1000; // 30 minutes
 const TOKEN_REFRESH_THRESHOLD = 15 * 60 * 1000; // Refresh token if it's within 15 minutes of expiration
 
-// Set session expiration time in Redis
-const setSessionExpiration = (sessionId, ttl) => {
-  redisClient.expire(sessionId, ttl / 1000, (err) => {
-    if (err) {
-      console.error('Error setting session expiration:', err);
-    }
-  });
+/**
+ * Regenerate session token for long sessions
+ * Note: Sessions are now managed by MongoDB via connect-mongodb-session
+ * This method is kept for JWT token regeneration
+ */
+const regenerateSessionToken = (user) => {
+  return jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '1h' });
 };
 
-// Regenerate session token for long sessions
-const regenerateSessionToken = (user, existingSessionId, callback) => {
-  const newToken = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '15m' });
-  
-  // Replace the existing session ID with the new one in Redis
-  redisClient.set(existingSessionId, newToken, 'EX', SESSION_EXPIRATION_TIME / 1000, (err) => {
-    if (err) {
-      console.error('Error regenerating session token:', err);
-      callback(err, null);
-    } else {
-      callback(null, newToken);
+/**
+ * Check if a session exists in MongoDB
+ * @param {string} sessionId - The session ID to check
+ * @param {function} callback - Callback function (err, exists)
+ */
+const checkActiveSession = async (sessionId, callback) => {
+  try {
+    if (!mongoStore) {
+      return callback(new Error('MongoDB session store not initialized'), false);
     }
-  });
-};
-
-// Check active session status
-const checkActiveSession = (sessionId, callback) => {
-  redisClient.get(sessionId, (err, result) => {
-    if (err) {
-      console.error('Error checking active session:', err);
-      callback(err, false);
-    } else {
-      callback(null, result !== null);
-    }
-  });
+    
+    // Get session from MongoDB store
+    mongoStore.get(sessionId, (err, session) => {
+      if (err) {
+        console.error('Error checking active session:', err);
+        callback(err, false);
+      } else {
+        callback(null, session !== null && session !== undefined);
+      }
+    });
+  } catch (error) {
+    console.error('Error checking active session:', error);
+    callback(error, false);
+  }
 };
 
 /**
@@ -87,12 +86,11 @@ const generateAccessToken = (user) => {
 };
 
 module.exports = {
-  setSessionExpiration,
   regenerateSessionToken,
   checkActiveSession,
   isSessionExpired,
   shouldRefreshToken,
   updateLastActivity,
-  generateAccessToken, // Add this function to the exports
+  generateAccessToken,
 };
  

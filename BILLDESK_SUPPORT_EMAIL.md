@@ -1,0 +1,173 @@
+# Email Template for BillDesk Support
+
+---
+
+**To:** BillDesk UAT Support / Your Account Manager  
+**Subject:** IP Whitelisting Required for UAT Testing - Merchant ID: BDUAT2K564 - Error GNAUE0003
+
+---
+
+Dear BillDesk Support Team,
+
+I am writing to request IP whitelisting for our UAT testing environment. We are currently experiencing authentication failures (Error Code: GNAUE0003) when attempting to integrate with BillDesk's payment gateway API v1.2.
+
+## Current Situation
+
+We have successfully implemented the BillDesk payment integration following the official API documentation, including proper JOSE (JSON Object Signing and Encryption) implementation. However, all API requests to the UAT environment are returning a 401 Unauthorized error.
+
+## Error Details
+
+**Error Response:**
+```json
+{
+  "status": 401,
+  "error_type": "authentication_error",
+  "error_code": "GNAUE0003",
+  "message": "Authentication failed"
+}
+```
+
+**Test Request Details:**
+- **BD-Traceid:** TEST176313613509374
+- **BD-Timestamp:** 1763136135 (2025-11-14T16:02:15.000Z)
+- **API Endpoint:** https://uat1.billdesk.com/u2/payments/ve1_2/orders/create
+- **Request Method:** POST
+
+## Our Credentials
+
+**Merchant Information:**
+- **Merchant ID:** BDUAT2K564
+- **Client ID:** bduat2k564sj
+- **Security ID (Key ID):** 7h2wbBuQpgAU
+
+## Implementation Verification
+
+We have thoroughly tested our implementation and confirmed:
+
+✅ **Environment Variables:** All required BillDesk credentials are properly configured  
+✅ **Encryption (JWE):** Successfully generating encrypted payloads using A256GCM algorithm  
+✅ **Signing (JWS):** Successfully signing requests using HS256 algorithm with correct headers  
+✅ **Request Format:** Following JOSE specifications with proper Content-Type (application/jose)  
+✅ **Headers:** Including all required headers (BD-Traceid, BD-Timestamp, Authorization)  
+✅ **Authentication:** Using Basic Authentication with clientId:clientSecret  
+
+**JWS Header Format Used:**
+```json
+{
+  "alg": "HS256",
+  "kid": "7h2wbBuQpgAU",
+  "clientid": "bduat2k564sj"
+}
+```
+
+**JWE Header Format Used:**
+```json
+{
+  "alg": "dir",
+  "enc": "A256GCM",
+  "kid": "7h2wbBuQpgAU",
+  "clientid": "bduat2k564sj"
+}
+```
+
+## Test Payload Example
+
+We created a test order with the following structure:
+```json
+{
+  "mercid": "BDUAT2K564",
+  "orderid": "TEST_ORDER_1731613613509",
+  "amount": "100.00",
+  "currency": "356",
+  "order_date": "2025-11-14T21:30:00+05:30",
+  "ru": "http://localhost:5173/payment/return",
+  "itemcode": "DIRECT",
+  "device": {
+    "init_channel": "internet",
+    "ip": "[CLIENT_IP]",
+    "user_agent": "Mozilla/5.0",
+    "accept_header": "text/html"
+  }
+}
+```
+
+This payload was properly encrypted using JWE, then signed using JWS before sending to the API endpoint.
+
+## Server Information
+
+**Current Development Environment:**
+- **Environment:** Cloud Server (AWS/Ubuntu)
+- **Server Location:** India (ap-south-1)
+- **Server IP Address:** 3.110.223.68
+
+We are currently testing from our cloud server. This is a static IP address that will remain consistent for all future testing and production use.
+
+## Request for Assistance
+
+Based on the error code GNAUE0003 and our successful implementation verification, we believe the issue is related to IP whitelisting. We kindly request the following:
+
+1. **IP Whitelisting:** Please whitelist our server IP address for the UAT environment
+   - **IP Address to Whitelist:** 3.110.223.68
+
+2. **Credential Verification:** Please confirm that our credentials are active and correctly configured:
+   - Merchant ID: BDUAT2K564
+   - Client ID: bduat2k564sj
+   - Security ID: 7h2wbBuQpgAU
+
+3. **UAT Access Confirmation:** Please confirm that these credentials have proper access to the UAT environment
+
+4. **Additional Requirements:** Please advise if there are any additional requirements or configurations needed for UAT testing
+
+## Technical Compliance
+
+Our implementation complies with:
+- ✅ BillDesk API v1.2 specifications
+- ✅ JOSE (RFC 7515 & RFC 7516) standards
+- ✅ Proper encryption using A256GCM (AES-256-GCM)
+- ✅ Proper signing using HS256 (HMAC-SHA256)
+- ✅ All required headers and authentication mechanisms
+- ✅ Idempotency with unique BD-Traceid values
+- ✅ Proper timestamp format (epoch seconds)
+
+## Implementation Timeline
+
+We are in the final stages of our BillDesk integration and need UAT access to complete our testing before production deployment. We would greatly appreciate your prompt assistance with IP whitelisting.
+
+## Contact Information
+
+**Technical Contact:**
+- **Name:** [Your Name]
+- **Email:** [Your Email]
+- **Phone:** [Your Phone]
+- **Company:** [Your Company Name]
+
+## Next Steps
+
+Once our IP is whitelisted, we will:
+1. Conduct comprehensive UAT testing
+2. Test all payment flows (order creation, transaction processing, refunds)
+3. Test webhook integrations
+4. Verify mandate and tokenization flows
+5. Document all test results
+
+We are ready to provide any additional information you may need to expedite this request.
+
+Thank you for your prompt attention to this matter. We look forward to successfully completing our BillDesk integration.
+
+Best regards,
+
+[Your Name]  
+[Your Title]  
+[Your Company]  
+[Your Contact Information]
+
+---
+
+## Attachments (if applicable)
+- Test request logs
+- Implementation verification report
+- Server IP verification screenshot
+
+---
+
+**Note:** This email should be sent to your BillDesk relationship manager or the UAT support email address provided in your merchant documentation.

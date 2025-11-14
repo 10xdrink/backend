@@ -16,6 +16,16 @@ const initializePayment = async (req, res) => {
     const { orderId } = req.params;
     logger.info(`Initializing BillDesk payment for order: ${orderId}`);
     
+    // Capture actual client IP address
+    const clientIp = req.headers['x-forwarded-for']?.split(',')[0].trim() || 
+                     req.headers['x-real-ip'] || 
+                     req.connection.remoteAddress || 
+                     req.socket.remoteAddress || 
+                     req.ip || 
+                     '127.0.0.1';
+    
+    logger.info(`Client IP captured: ${clientIp}`);
+    
     // Find order
     const order = await Order.findById(orderId);
     if (!order) {
@@ -40,14 +50,16 @@ const initializePayment = async (req, res) => {
     await order.save();
     logger.info(`Order ${orderId} status updated to payment_pending`);
     
-    // Create BillDesk order using the service
+    // Create BillDesk order using the service with client IP
     try {
-      const billDeskOrder = await billDeskService.createOrder(order);
-      logger.info(`BillDesk order created successfully for order ${orderId}`, billDeskOrder);
+      const billDeskOrder = await billDeskService.createPaymentRequest(order, clientIp);
+      // Log the complete response structure for debugging
+      logger.info(`BillDesk order created successfully for order ${orderId}`);
+      logger.info('BillDesk response structure:', JSON.stringify(billDeskOrder, null, 2));
       
-      // Ensure all required fields are present
-      if (!billDeskOrder.paymentUrl || !billDeskOrder.msg || !billDeskOrder.checksum) {
-        throw new Error('Missing required payment data from BillDesk service');
+      // Check if we got bdOrderId from BillDesk response
+      if (!billDeskOrder.bdOrderId && !billDeskOrder.formHtml) {
+        throw new Error('BillDesk did not return payment details. Likely authentication issue.');
       }
       
       // Return BillDesk payment data
@@ -57,10 +69,15 @@ const initializePayment = async (req, res) => {
           orderId: order._id,
           orderNumber: order.orderNumber,
           transactionId: billDeskOrder.transactionId,
-          paymentUrl: billDeskOrder.paymentUrl,
-          merchantId: billDeskOrder.merchantId,
-          msg: billDeskOrder.msg,
-          checksum: billDeskOrder.checksum
+          paymentData: {
+            paymentUrl: billDeskOrder.paymentUrl,
+            bdOrderId: billDeskOrder.bdOrderId,
+            merchantId: billDeskOrder.merchantId,
+            rdata: billDeskOrder.rdata,
+            // For API v1.2 flow
+            isRedirect: billDeskOrder.isRedirect || false,
+            formHtml: billDeskOrder.formHtml || null
+          }
         }
       });
     } catch (billDeskError) {
@@ -82,11 +99,18 @@ const initializePayment = async (req, res) => {
 const handlePaymentReturn = async (req, res) => {
   try {
     const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
-    logger.info(`BillDesk payment return received: ${JSON.stringify(req.body)}`);
+    logger.info(`BillDesk payment return received`);
     
-    // Process the return data using the service
+    // Check if we have a response body
+    if (!req.body) {
+      logger.error('Empty response body from BillDesk');
+      return res.redirect(`${FRONTEND_URL}/payment/failed?message=Invalid payment response`);
+    }
+    
+    // Process the return data using the service with JWS verification
     try {
-      const result = await billDeskService.handleTransactionReturn(req.body);
+      // Pass the raw response to processResponse which will verify the JWS signature
+      const result = await billDeskService.processResponse(req.body);
       
       // Find the order associated with this transaction
       const transaction = await Transaction.findById(result.transactionId);
@@ -156,17 +180,18 @@ const handlePaymentReturn = async (req, res) => {
  */
 const handleWebhook = async (req, res) => {
   try {
-    // Log the incoming webhook data for debugging
-    logger.info(`BillDesk webhook received: ${JSON.stringify(req.body)}`);
+    logger.info('BillDesk webhook received');
     
-    // Simple validation to ensure we have data
-    if (!req.body || !req.body.msg) {
-      return res.status(400).json({ success: false, message: 'No webhook data received' });
+    // Check if we have a response body
+    if (!req.body) {
+      logger.error('Empty webhook payload');
+      return res.status(400).json({ success: false, message: 'Empty webhook payload' });
     }
     
-    // Process the webhook using the service
+    // Process the webhook data using the service with JWS verification
     try {
-      const result = await billDeskService.processWebhook(req);
+      // Pass the raw response to processResponse which will verify the JWS signature
+      const result = await billDeskService.processResponse(req.body);
       
       // Find the order associated with this transaction
       const order = await Order.findOne({ orderNumber: result.orderNumber });
@@ -208,47 +233,77 @@ const handleWebhook = async (req, res) => {
 const checkPaymentStatus = async (req, res) => {
   try {
     const { orderId } = req.params;
+    logger.info(`Checking payment status for order: ${orderId}`);
     
     // Find order
     const order = await Order.findById(orderId);
     if (!order) {
+      logger.error(`Order not found: ${orderId}`);
       return res.status(404).json({ success: false, message: 'Order not found' });
     }
     
     // Check if order belongs to current user
-    if (order.customer.toString() !== req.user._id.toString()) {
+    if (req.user && order.customer && order.customer.toString() !== req.user._id.toString()) {
+      logger.error(`User ${req.user._id} attempted to access order ${orderId} belonging to ${order.customer}`);
       return res.status(403).json({ success: false, message: 'Unauthorized' });
     }
     
     // Find the transaction for this order
-    const transaction = await Transaction.findOne({ orderId: order._id }).sort({ createdAt: -1 });
+    const transaction = await Transaction.findOne({ order: order._id }).sort({ createdAt: -1 });
+    
+    // Check if the order has a pending payment status and was last updated more than 60 minutes ago
+    if (order.paymentStatus === 'pending' && transaction) {
+      const lastUpdated = new Date(transaction.updatedAt).getTime();
+      const currentTime = new Date().getTime();
+      const timeDifference = currentTime - lastUpdated;
+      const sixtyMinutesInMs = 60 * 60 * 1000;
+      
+      if (timeDifference > sixtyMinutesInMs) {
+        logger.info(`Order ${orderId} has pending payment status for more than 60 minutes, retrieving status from BillDesk`);
+        
+        try {
+          // Retrieve transaction status from BillDesk
+          const transactionStatus = await billDeskService.retrieveTransaction(order.orderNumber);
+          
+          if (transactionStatus.success) {
+            // Update order status based on the retrieved transaction status
+            const { status } = transactionStatus.data;
+            
+            if (status && status.toUpperCase() === 'SUCCESS') {
+              order.paymentStatus = 'success';
+              transaction.status = 'success';
+              await Promise.all([order.save(), transaction.save()]);
+              logger.info(`Updated order ${orderId} status to success based on BillDesk transaction status`);
+            } else if (status && status.toUpperCase() === 'FAILED') {
+              order.paymentStatus = 'failed';
+              transaction.status = 'failed';
+              await Promise.all([order.save(), transaction.save()]);
+              logger.info(`Updated order ${orderId} status to failed based on BillDesk transaction status`);
+            }
+          } else {
+            logger.error(`Failed to retrieve transaction status from BillDesk for order ${orderId}: ${transactionStatus.message}`);
+          }
+        } catch (txnError) {
+          logger.error(`Error retrieving transaction status from BillDesk: ${txnError.message}`);
+        }
+      }
+    }
     
     if (transaction) {
-      // If there's a transaction, check its status with BillDesk
-      try {
-        await billDeskService.retrieveTransaction(order.orderNumber);
-        
-        // Refresh the transaction after status update
-        const updatedTransaction = await Transaction.findById(transaction._id);
-        
-        // Return transaction details
-        return res.status(200).json({
-          success: true,
-          data: {
-            status: updatedTransaction.status,
-            paymentMethod: 'billdesk',
-            amount: updatedTransaction.amount,
-            transactionId: updatedTransaction._id,
-            billDeskTxnId: updatedTransaction.metadata?.billDeskTxnId || null,
-            bankTxnId: updatedTransaction.metadata?.bankTxnId || null,
-            createdAt: updatedTransaction.createdAt,
-            updatedAt: updatedTransaction.updatedAt
-          }
-        });
-      } catch (txnError) {
-        logger.error(`Error retrieving transaction status: ${txnError.message}`);
-        // If there's an error checking with BillDesk, return the local status
-      }
+      // Return transaction details
+      return res.status(200).json({
+        success: true,
+        data: {
+          status: transaction.status,
+          paymentMethod: 'billdesk',
+          amount: transaction.amount,
+          transactionId: transaction._id,
+          billDeskTxnId: transaction.metadata?.billDeskTxnId || null,
+          bankTxnId: transaction.metadata?.bankTxnId || null,
+          createdAt: transaction.createdAt,
+          updatedAt: transaction.updatedAt
+        }
+      });
     }
     
     // If no transaction found or error checking status, return order payment status
@@ -270,9 +325,124 @@ const checkPaymentStatus = async (req, res) => {
   }
 };
 
+/**
+ * Proxy the payment request to BillDesk API
+ * This avoids CORS issues by having our server make the request
+ */
+async function proxyPaymentRequest(req, res) {
+  try {
+    const { paymentUrl, payload, headers } = req.body;
+    
+    if (!paymentUrl || !payload || !headers) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required parameters: paymentUrl, payload, or headers'
+      });
+    }
+    
+    logger.info('Proxying payment request to BillDesk API', {
+      url: paymentUrl,
+      payloadLength: payload.length,
+      headers: Object.keys(headers)
+    });
+    
+    // Use node-fetch to make the request
+    const fetch = require('node-fetch');
+    
+    logger.info('Making request to BillDesk API with the following details:', {
+      url: paymentUrl,
+      method: 'POST',
+      headerKeys: Object.keys(headers),
+      contentType: headers['Content-Type'],
+      payloadLength: payload.length,
+      payloadPrefix: payload.substring(0, 50) + '...'
+    });
+    
+    try {
+      const response = await fetch(paymentUrl, {
+        method: 'POST',
+        headers: headers,
+        body: payload
+      });
+      
+      logger.info('BillDesk API response received:', {
+        status: response.status,
+        statusText: response.statusText,
+        headers: Object.fromEntries([...response.headers.entries()]),
+        redirected: response.redirected,
+        redirectUrl: response.redirected ? response.url : null
+      });
+      
+      // Get response data
+      const responseData = await response.text();
+      const contentType = response.headers.get('content-type');
+      
+      logger.info('BillDesk API response received', {
+        status: response.status,
+        contentType,
+        responseLength: responseData.length
+      });
+      
+      // Check if we got a redirect
+      if (response.redirected) {
+        return res.json({
+          success: true,
+          redirectUrl: response.url
+        });
+      }
+      
+      // Check if we got HTML
+      if (contentType && contentType.includes('text/html')) {
+        return res.json({
+          success: true,
+          html: responseData
+        });
+      }
+      
+      // Check if we got JSON or JOSE
+      if (contentType && (contentType.includes('application/json') || contentType.includes('application/jose'))) {
+        // Log the response data for debugging
+        try {
+          const jsonData = JSON.parse(responseData);
+          logger.info('BillDesk API JSON response:', jsonData);
+        } catch (e) {
+          logger.info('BillDesk API response (not JSON):', responseData);
+        }
+        
+        // For JOSE responses, we'll just pass them through
+        return res.json({
+          success: response.ok,
+          data: responseData,
+          status: response.status
+        });
+      }
+      
+      // Default response
+      return res.json({
+        success: response.ok,
+        status: response.status,
+        data: responseData
+      });
+    } catch (fetchError) {
+      logger.error('Error making request to BillDesk API:', fetchError);
+      return res.status(500).json({
+        success: false,
+        message: `Error making request to BillDesk API: ${fetchError.message}`
+      });
+    }
+  } catch (error) {
+    logger.error('Error proxying payment request:', error);
+    return res.status(500).json({
+      success: false,
+      message: `Error proxying payment request: ${error.message}`
+    });
+  }
+}
+
 module.exports = {
   initializePayment,
   handlePaymentReturn,
   handleWebhook,
-  checkPaymentStatus
+  checkPaymentStatus,
+  proxyPaymentRequest
 };

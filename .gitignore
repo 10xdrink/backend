@@ -29,7 +29,12 @@ coverage/
 bower_components/
 
 # Environment variables
-# .env
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+.env.*.local
 
 # VS Code settings
 .vscode/
@@ -45,10 +50,23 @@ temp/
 dist/
 build/
 
-# Miscellaneous
-*.tgz
-*.bak
-*.swp
-.env
+# Credentials and keys
+credentials/
 credentials/*.js
 credentials/*.js.env
+*.pem
+*.key
+*.cert
+*.crt
+*.p12
+*.pfx
+
+# Backup files
+backups/
+*.backup
+*.bak
+*.swp
+*.old
+
+# Miscellaneous
+*.tgz
